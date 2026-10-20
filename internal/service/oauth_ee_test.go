@@ -57,9 +57,21 @@ const (
 type mockIdP struct {
 	ts         *httptest.Server
 	baseURL    string
+	issuer     string          // advertised issuer; defaults to baseURL (see issuerValue)
 	signKey    *rsa.PrivateKey // key the JWKS advertises
 	idTokClaim jwt.MapClaims   // claims minted into the id_token by /token
 	userinfo   map[string]any  // body returned by /userinfo
+}
+
+// issuerValue is the issuer the IdP advertises in discovery AND stamps into the
+// id_token's `iss`. Defaults to baseURL; a test may set a different value (e.g.
+// baseURL+"/") to reproduce the real-world case where the discovered issuer
+// differs from the configured discovery URL.
+func (m *mockIdP) issuerValue() string {
+	if m.issuer != "" {
+		return m.issuer
+	}
+	return m.baseURL
 }
 
 func newMockIdP(t *testing.T) *mockIdP {
@@ -73,7 +85,7 @@ func newMockIdP(t *testing.T) *mockIdP {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{
-			"issuer":                                m.baseURL,
+			"issuer":                                m.issuerValue(),
 			"authorization_endpoint":                m.baseURL + "/authorize",
 			"token_endpoint":                        m.baseURL + "/token",
 			"userinfo_endpoint":                     m.baseURL + "/userinfo",
@@ -118,7 +130,7 @@ func newMockIdP(t *testing.T) *mockIdP {
 func (m *mockIdP) mintIDToken(t *testing.T, key *rsa.PrivateKey, alg string, claims jwt.MapClaims) string {
 	t.Helper()
 	full := jwt.MapClaims{
-		"iss": m.baseURL,
+		"iss": m.issuerValue(),
 		"aud": testClientID,
 		"sub": "default-sub",
 		"iat": time.Now().Unix(),
@@ -162,6 +174,7 @@ func (m *mockIdP) resolved(t *testing.T) *resolvedProvider {
 			Issuer:       m.baseURL,
 			RedirectURI:  "https://ragflow.dukekunshan.edu.cn/api/v1/auth/oauth/oidc/callback",
 		},
+		issuer:      meta.Issuer,
 		authURL:     meta.AuthorizationEndpoint,
 		tokenURL:    meta.TokenEndpoint,
 		userinfoURL: meta.UserinfoEndpoint,
@@ -317,8 +330,30 @@ func TestVerifyIDTokenRejections(t *testing.T) {
 	})
 }
 
-// --- Duke normalization precedence -----------------------------------------
+// TestVerifyIDTokenDiscoveredIssuerTrailingSlash reproduces the Duke case: the
+// provider advertises an issuer WITH a trailing slash ("…/oidc/") while the
+// configured discovery URL has none ("…/oidc"), and the ID token's `iss` carries
+// the slash. Verification must use the DISCOVERED issuer, not the config string,
+// or real logins fail with "token has invalid issuer".
+func TestVerifyIDTokenDiscoveredIssuerTrailingSlash(t *testing.T) {
+	oidcAllowLoopback(t)
+	m := newMockIdP(t)
+	m.issuer = m.baseURL + "/" // discovery + id_token iss carry the trailing slash
 
+	r := m.resolved(t)
+	if r.issuer == r.provider.Issuer {
+		t.Fatalf("precondition: discovered issuer %q should differ from config %q", r.issuer, r.provider.Issuer)
+	}
+	if r.issuer != m.baseURL+"/" {
+		t.Fatalf("resolved issuer = %q, want %q", r.issuer, m.baseURL+"/")
+	}
+	idt := m.mintIDToken(t, m.signKey, "RS256", jwt.MapClaims{"email": "slash@dukekunshan.edu.cn"})
+	if _, err := verifyIDToken(context.Background(), r, idt); err != nil {
+		t.Fatalf("expected trailing-slash discovered issuer to verify, got: %v", err)
+	}
+}
+
+// --- Duke normalization precedence -----------------------------------------
 func TestNormalizeUserDukeFallbacks(t *testing.T) {
 	cases := []struct {
 		name                               string

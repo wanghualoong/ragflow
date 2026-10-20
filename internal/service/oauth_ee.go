@@ -187,6 +187,7 @@ func fetchJWKS(ctx context.Context, uri string) (*jose.JSONWebKeySet, error) {
 // resolvedProvider merges static config with OIDC-discovered endpoints.
 type resolvedProvider struct {
 	provider    *config.OAuthProvider
+	issuer      string
 	authURL     string
 	tokenURL    string
 	userinfoURL string
@@ -201,6 +202,7 @@ func (s *UserService) resolveProvider(ctx context.Context, channel string) (*res
 	}
 	r := &resolvedProvider{
 		provider:    p,
+		issuer:      p.Issuer,
 		authURL:     p.AuthorizationURL,
 		tokenURL:    p.TokenURL,
 		userinfoURL: p.UserinfoURL,
@@ -212,6 +214,14 @@ func (s *UserService) resolveProvider(ctx context.Context, channel string) (*res
 		m, err := fetchOIDCMetadata(ctx, p.Issuer)
 		if err != nil {
 			return nil, common.CodeServerError, err
+		}
+		// The ID token's `iss` must equal the issuer the provider DECLARES in its
+		// discovery document, not the configured discovery base — they differ
+		// routinely by a trailing slash (e.g. Duke advertises
+		// "https://oauth.oit.duke.edu/oidc/" while the config carries it without
+		// the slash). Verify against the discovered value (OIDC Core §3.1.3.7).
+		if m.Issuer != "" {
+			r.issuer = m.Issuer
 		}
 		r.authURL = m.AuthorizationEndpoint
 		r.tokenURL = m.TokenEndpoint
@@ -421,7 +431,7 @@ func verifyIDToken(ctx context.Context, r *resolvedProvider, idToken string) (jw
 	_, err = jwt.ParseWithClaims(idToken, claims, keyfunc,
 		jwt.WithValidMethods(r.signingAlgs),
 		jwt.WithAudience(r.provider.ClientID),
-		jwt.WithIssuer(r.provider.Issuer),
+		jwt.WithIssuer(r.issuer),
 	)
 	if err != nil {
 		return nil, err
