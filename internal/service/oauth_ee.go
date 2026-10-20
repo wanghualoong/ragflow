@@ -491,10 +491,15 @@ func (s *UserService) upsertOAuthUser(ctx context.Context, channel string, info 
 		return existing, false, common.CodeSuccess, nil
 	}
 
+	// OIDC provisioning is intentionally NOT gated by EnableRegister():
+	// EnableRegister() (REGISTER_ENABLED) controls *password* self-signup only.
+	// An identity vouched for by the trusted IdP (Duke NetID) is always
+	// provisioned on first login. This matches the v0.27.2 Python behavior where
+	// the OAuth callback (api/apps/restful_apis/user_api.py) calls user_register
+	// directly, bypassing the REGISTER_ENABLED check that guards only the
+	// password /register endpoint — so new Duke users keep onboarding via SSO
+	// even with REGISTER_ENABLED=0.
 	cfg := server.GetConfig()
-	if !cfg.EnableRegister() {
-		return nil, false, common.CodeOperatingError, fmt.Errorf("user registration is disabled")
-	}
 	user, err := s.provisionOAuthUser(channel, info, cfg)
 	if err != nil {
 		return nil, false, common.CodeServerError, err

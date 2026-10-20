@@ -49,6 +49,9 @@ func setupOIDCServerConfig(t *testing.T) {
 	reBare := regexp.MustCompile(`\$\{[A-Za-z0-9_]+\}`)
 	rendered := reBare.ReplaceAllString(reDef.ReplaceAllString(string(raw), "$1"), "")
 	rendered += `
+authentication:
+  enable_register: false
+  disable_password_login: true
 oauth:
   oidc:
     type: "oidc"
@@ -96,6 +99,14 @@ func TestOIDCFullLoopWithConfig(t *testing.T) {
 
 	svc := NewUserService()
 	ctx := context.Background()
+
+	// Regression guard: OIDC provisioning must NOT be gated by EnableRegister
+	// (which governs password self-signup only). The rendered config disables
+	// registration, yet a first-time SSO login below must still provision — this
+	// matches v0.27.2, where the OAuth callback bypasses the REGISTER_ENABLED check.
+	if server.GetConfig().EnableRegister() {
+		t.Fatal("test precondition: expected EnableRegister=false")
+	}
 
 	// --- GetLoginChannels: the login page must see the channel ---------------
 	channels, _, err := svc.GetLoginChannels()
