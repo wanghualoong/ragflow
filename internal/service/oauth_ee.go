@@ -18,11 +18,27 @@ package service
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
 	"ragflow/internal/common"
+	"ragflow/internal/dao"
 	"ragflow/internal/engine/kvrocks"
 	"ragflow/internal/entity"
-	"time"
+	"ragflow/internal/server"
+	"ragflow/internal/server/config"
+
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/golang-jwt/jwt/v5"
+	"gorm.io/gorm"
 )
 
 // OAuthLoginInit prepares a redirect to the channel's authorization URL.
@@ -43,10 +59,576 @@ type OAuthCallbackResult struct {
 	IsNewUser bool
 }
 
-func (s *UserService) OAuthLoginInitiate(channel string, redis *kvrocks.Client) (*OAuthLoginInit, common.ErrorCode, error) {
-	return nil, common.CodeServerError, fmt.Errorf("oauth login initiate not implemented")
+// oauthStateTTL bounds how long an in-flight login may take between the
+// redirect to the IdP and the callback.
+const oauthStateTTL = 10 * time.Minute
+
+// ---------------------------------------------------------------------------
+// OIDC discovery + JWKS caches
+// ---------------------------------------------------------------------------
+
+// oidcMetadata is the subset of the OIDC discovery document we consume.
+type oidcMetadata struct {
+	Issuer                string   `json:"issuer"`
+	AuthorizationEndpoint string   `json:"authorization_endpoint"`
+	TokenEndpoint         string   `json:"token_endpoint"`
+	UserinfoEndpoint      string   `json:"userinfo_endpoint"`
+	JWKSURI               string   `json:"jwks_uri"`
+	SigningAlgsSupported  []string `json:"id_token_signing_alg_values_supported"`
 }
 
+type cachedMetadata struct {
+	meta      *oidcMetadata
+	fetchedAt time.Time
+}
+
+type cachedJWKS struct {
+	set       *jose.JSONWebKeySet
+	fetchedAt time.Time
+}
+
+var (
+	oidcMetaCache = map[string]*cachedMetadata{}
+	oidcMetaMu    sync.Mutex
+
+	jwksCache = map[string]*cachedJWKS{}
+	jwksMu    sync.Mutex
+
+	// discoveryTTL keeps discovery/JWKS lookups cheap; a login burst for 100+
+	// users should not re-fetch the discovery document every time.
+	discoveryTTL = time.Hour
+)
+
+// Asymmetric signing algorithms safe to accept for OIDC ID tokens. Symmetric
+// HMAC (HS*) and "none" are intentionally excluded: when the verification key
+// is the asymmetric public key from the provider's JWKS, accepting HS256 lets
+// an attacker forge tokens by HMAC-signing with the public key bytes
+// (RSA/HMAC algorithm-confusion, CWE-347); "none" disables verification
+// entirely. This mirrors api/apps/auth/oidc.py.
+var allowedOIDCSigningAlgs = map[string]struct{}{
+	"RS256": {}, "RS384": {}, "RS512": {},
+	"ES256": {}, "ES384": {}, "ES512": {},
+	"PS256": {}, "PS384": {}, "PS512": {},
+	"EdDSA": {},
+}
+
+// resolveSigningAlgs intersects the provider-advertised algorithms with the
+// safe allowlist, falling back to RS256 (the OIDC Core spec default) — never
+// to whatever a JWT header claims at verification time.
+func resolveSigningAlgs(advertised []string) []string {
+	safe := make([]string, 0, len(advertised))
+	for _, a := range advertised {
+		if _, ok := allowedOIDCSigningAlgs[a]; ok {
+			safe = append(safe, a)
+		}
+	}
+	if len(safe) == 0 {
+		return []string{"RS256"}
+	}
+	return safe
+}
+
+func fetchOIDCMetadata(ctx context.Context, issuer string) (*oidcMetadata, error) {
+	oidcMetaMu.Lock()
+	if c, ok := oidcMetaCache[issuer]; ok && time.Since(c.fetchedAt) < discoveryTTL {
+		m := c.meta
+		oidcMetaMu.Unlock()
+		return m, nil
+	}
+	oidcMetaMu.Unlock()
+
+	metaURL := strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
+	body, err := httpGet(ctx, metaURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetch OIDC metadata: %w", err)
+	}
+	var m oidcMetadata
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decode OIDC metadata: %w", err)
+	}
+	if m.Issuer == "" || m.AuthorizationEndpoint == "" || m.TokenEndpoint == "" {
+		return nil, fmt.Errorf("incomplete OIDC metadata from %s", metaURL)
+	}
+
+	oidcMetaMu.Lock()
+	oidcMetaCache[issuer] = &cachedMetadata{meta: &m, fetchedAt: time.Now()}
+	oidcMetaMu.Unlock()
+	return &m, nil
+}
+
+func fetchJWKS(ctx context.Context, uri string) (*jose.JSONWebKeySet, error) {
+	jwksMu.Lock()
+	if e, ok := jwksCache[uri]; ok && time.Since(e.fetchedAt) < discoveryTTL {
+		s := e.set
+		jwksMu.Unlock()
+		return s, nil
+	}
+	jwksMu.Unlock()
+
+	body, err := httpGet(ctx, uri, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetch JWKS: %w", err)
+	}
+	var set jose.JSONWebKeySet
+	if err := json.Unmarshal(body, &set); err != nil {
+		return nil, fmt.Errorf("decode JWKS: %w", err)
+	}
+
+	jwksMu.Lock()
+	jwksCache[uri] = &cachedJWKS{set: &set, fetchedAt: time.Now()}
+	jwksMu.Unlock()
+	return &set, nil
+}
+
+// ---------------------------------------------------------------------------
+// provider resolution
+// ---------------------------------------------------------------------------
+
+// resolvedProvider merges static config with OIDC-discovered endpoints.
+type resolvedProvider struct {
+	provider    *config.OAuthProvider
+	authURL     string
+	tokenURL    string
+	userinfoURL string
+	jwksURI     string
+	signingAlgs []string
+}
+
+func (s *UserService) resolveProvider(ctx context.Context, channel string) (*resolvedProvider, common.ErrorCode, error) {
+	p, ok := server.GetConfig().GetOAuthConfig().Providers[channel]
+	if !ok {
+		return nil, common.CodeNotFound, fmt.Errorf("unknown login channel: %s", channel)
+	}
+	r := &resolvedProvider{
+		provider:    p,
+		authURL:     p.AuthorizationURL,
+		tokenURL:    p.TokenURL,
+		userinfoURL: p.UserinfoURL,
+	}
+	if strings.EqualFold(p.Type, "oidc") || p.Issuer != "" {
+		if p.Issuer == "" {
+			return nil, common.CodeExceptionError, fmt.Errorf("oidc channel %q missing issuer", channel)
+		}
+		m, err := fetchOIDCMetadata(ctx, p.Issuer)
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+		r.authURL = m.AuthorizationEndpoint
+		r.tokenURL = m.TokenEndpoint
+		r.userinfoURL = m.UserinfoEndpoint
+		r.jwksURI = m.JWKSURI
+		r.signingAlgs = resolveSigningAlgs(m.SigningAlgsSupported)
+	}
+	if r.authURL == "" || r.tokenURL == "" {
+		return nil, common.CodeExceptionError, fmt.Errorf("channel %q has no usable endpoints", channel)
+	}
+	return r, common.CodeSuccess, nil
+}
+
+// ---------------------------------------------------------------------------
+// login initiate
+// ---------------------------------------------------------------------------
+
+func (s *UserService) OAuthLoginInitiate(channel string, redis *kvrocks.Client) (*OAuthLoginInit, common.ErrorCode, error) {
+	ctx := context.Background()
+	r, code, err := s.resolveProvider(ctx, channel)
+	if err != nil {
+		return nil, code, err
+	}
+
+	state := common.GenerateUUID()
+	if redis != nil {
+		// consume-once CSRF/replay guard, complementary to the state cookie.
+		redis.Set(ctx, oauthStateKey(channel, state), channel, oauthStateTTL)
+	}
+
+	params := url.Values{}
+	params.Set("client_id", r.provider.ClientID)
+	params.Set("redirect_uri", r.provider.RedirectURI)
+	params.Set("response_type", "code")
+	if r.provider.Scope != "" {
+		params.Set("scope", r.provider.Scope)
+	}
+	params.Set("state", state)
+
+	sep := "?"
+	if strings.Contains(r.authURL, "?") {
+		sep = "&"
+	}
+	return &OAuthLoginInit{
+		State:        state,
+		AuthURL:      r.authURL + sep + params.Encode(),
+		Channel:      channel,
+		CookieMaxAge: oauthStateTTL,
+	}, common.CodeSuccess, nil
+}
+
+// ---------------------------------------------------------------------------
+// callback
+// ---------------------------------------------------------------------------
+
 func (s *UserService) OAuthCallback(ctx context.Context, channel, code, callbackState, expectedState string, redis *kvrocks.Client) (*OAuthCallbackResult, common.ErrorCode, error) {
-	return nil, common.CodeDataError, fmt.Errorf("oauth callback not implemented")
+	if code == "" {
+		return nil, common.CodeArgumentError, fmt.Errorf("missing authorization code")
+	}
+
+	// CSRF: double-submit cookie. The state echoed by the IdP must match the
+	// state we set as an HttpOnly cookie on this browser at initiate time.
+	if callbackState == "" || expectedState == "" ||
+		subtle.ConstantTimeCompare([]byte(callbackState), []byte(expectedState)) != 1 {
+		return nil, common.CodeAuthenticationError, fmt.Errorf("invalid oauth state")
+	}
+	// Consume-once in redis defends against replay even if the cookie leaks.
+	if redis != nil {
+		key := oauthStateKey(channel, callbackState)
+		if stored, _ := redis.Get(ctx, key); stored != channel {
+			return nil, common.CodeAuthenticationError, fmt.Errorf("oauth state expired or already used")
+		}
+		redis.Delete(ctx, key)
+	}
+
+	r, rcode, err := s.resolveProvider(ctx, channel)
+	if err != nil {
+		return nil, rcode, err
+	}
+
+	tok, err := exchangeCode(ctx, r, code)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	info, err := fetchUserInfo(ctx, r, tok)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	if info.Email == "" {
+		return nil, common.CodeDataError, fmt.Errorf("identity provider did not return an email address")
+	}
+
+	user, isNew, ucode, err := s.upsertOAuthUser(ctx, channel, info)
+	if err != nil {
+		return nil, ucode, err
+	}
+	return &OAuthCallbackResult{User: user, IsNewUser: isNew}, common.CodeSuccess, nil
+}
+
+// ---------------------------------------------------------------------------
+// token exchange + userinfo
+// ---------------------------------------------------------------------------
+
+type tokenResponse struct {
+	AccessToken string `json:"access_token"`
+	IDToken     string `json:"id_token"`
+	TokenType   string `json:"token_type"`
+}
+
+func exchangeCode(ctx context.Context, r *resolvedProvider, code string) (*tokenResponse, error) {
+	form := url.Values{}
+	form.Set("client_id", r.provider.ClientID)
+	form.Set("client_secret", r.provider.ClientSecret)
+	form.Set("code", code)
+	form.Set("redirect_uri", r.provider.RedirectURI)
+	form.Set("grant_type", "authorization_code")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := common.GetSSRFHTTPClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("exchange authorization code: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tr tokenResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return nil, fmt.Errorf("decode token response: %w", err)
+	}
+	if tr.AccessToken == "" {
+		return nil, fmt.Errorf("token endpoint did not return an access_token")
+	}
+	return &tr, nil
+}
+
+// normalizedUser is the Duke-normalized identity (see normalizeUser).
+type normalizedUser struct {
+	Email    string
+	Username string
+	Nickname string
+	Avatar   string
+}
+
+// fetchUserInfo gathers claims from the (optionally verified) ID token and the
+// userinfo endpoint, with userinfo taking precedence, then normalizes them.
+func fetchUserInfo(ctx context.Context, r *resolvedProvider, tok *tokenResponse) (*normalizedUser, error) {
+	claims := map[string]interface{}{}
+
+	// ID token (OIDC): signature-verified against the provider's JWKS with a
+	// pinned algorithm allowlist. Failure is fatal — we never trust an
+	// unverified ID token.
+	if tok.IDToken != "" && r.jwksURI != "" {
+		idClaims, err := verifyIDToken(ctx, r, tok.IDToken)
+		if err != nil {
+			return nil, fmt.Errorf("verify id token: %w", err)
+		}
+		for k, v := range idClaims {
+			claims[k] = v
+		}
+	}
+
+	// Userinfo endpoint (authoritative back-channel over TLS).
+	if r.userinfoURL != "" {
+		body, err := httpGet(ctx, r.userinfoURL, map[string]string{
+			"Authorization": "Bearer " + tok.AccessToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fetch userinfo: %w", err)
+		}
+		var ui map[string]interface{}
+		if err := json.Unmarshal(body, &ui); err != nil {
+			return nil, fmt.Errorf("decode userinfo: %w", err)
+		}
+		for k, v := range ui {
+			claims[k] = v
+		}
+	}
+
+	return normalizeUser(claims), nil
+}
+
+func verifyIDToken(ctx context.Context, r *resolvedProvider, idToken string) (jwt.MapClaims, error) {
+	set, err := fetchJWKS(ctx, r.jwksURI)
+	if err != nil {
+		return nil, err
+	}
+	keyfunc := func(t *jwt.Token) (interface{}, error) {
+		kid, _ := t.Header["kid"].(string)
+		keys := set.Key(kid)
+		if len(keys) == 0 {
+			return nil, fmt.Errorf("no signing key for kid %q", kid)
+		}
+		return keys[0].Key, nil
+	}
+
+	claims := jwt.MapClaims{}
+	_, err = jwt.ParseWithClaims(idToken, claims, keyfunc,
+		jwt.WithValidMethods(r.signingAlgs),
+		jwt.WithAudience(r.provider.ClientID),
+		jwt.WithIssuer(r.provider.Issuer),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
+// normalizeUser applies the Duke NetID field precedence:
+//   - email from userinfo
+//   - username = username | preferred_username | dukeNetID | sub, else email prefix
+//   - nickname = nickname | name, else username
+//   - avatar = avatar_url | picture
+//
+// This mirrors api/apps/auth/oauth.py normalize_user_info.
+func normalizeUser(claims map[string]interface{}) *normalizedUser {
+	get := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := claims[k]; ok {
+				if sv, ok := v.(string); ok && sv != "" {
+					return sv
+				}
+			}
+		}
+		return ""
+	}
+
+	email := get("email")
+	username := get("username", "preferred_username", "dukeNetID", "sub")
+	if username == "" && email != "" {
+		if i := strings.Index(email, "@"); i > 0 {
+			username = email[:i]
+		} else {
+			username = email
+		}
+	}
+	nickname := get("nickname", "name")
+	if nickname == "" {
+		nickname = username
+	}
+	avatar := get("avatar_url", "picture")
+
+	return &normalizedUser{Email: email, Username: username, Nickname: nickname, Avatar: avatar}
+}
+
+// ---------------------------------------------------------------------------
+// user provisioning
+// ---------------------------------------------------------------------------
+
+// upsertOAuthUser rotates the access token for an existing user (keyed by
+// email) or provisions a brand-new user+tenant for a first-time SSO login.
+func (s *UserService) upsertOAuthUser(ctx context.Context, channel string, info *normalizedUser) (*entity.User, bool, common.ErrorCode, error) {
+	existing, err := s.userDAO.GetByEmail(ctx, dao.DB, info.Email)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, common.CodeServerError, fmt.Errorf("lookup user by email: %w", err)
+	}
+	if existing != nil {
+		if existing.Status == nil || *existing.Status != "1" {
+			return nil, false, common.CodeForbidden, fmt.Errorf("user is disabled")
+		}
+		token := common.GenerateToken()
+		existing.AccessToken = &token
+		now := time.Now().Truncate(time.Second)
+		existing.LastLoginTime = &now
+		if err := s.userDAO.Update(ctx, dao.DB, existing); err != nil {
+			return nil, false, common.CodeServerError, fmt.Errorf("update user: %w", err)
+		}
+		return existing, false, common.CodeSuccess, nil
+	}
+
+	cfg := server.GetConfig()
+	if !cfg.EnableRegister() {
+		return nil, false, common.CodeOperatingError, fmt.Errorf("user registration is disabled")
+	}
+	user, err := s.provisionOAuthUser(channel, info, cfg)
+	if err != nil {
+		return nil, false, common.CodeServerError, err
+	}
+	return user, true, common.CodeSuccess, nil
+}
+
+// provisionOAuthUser mirrors UserService.Register (user + tenant + user_tenant +
+// root folder in one transaction) but sets no password and records the SSO
+// login channel.
+func (s *UserService) provisionOAuthUser(channel string, info *normalizedUser, cfg *config.Config) (*entity.User, error) {
+	userID := common.GenerateToken()
+	accessToken := common.GenerateToken()
+	status := "1"
+	loginChannel := channel
+	isSuperuser := false
+	language := defaultUserLanguage()
+	colorSchema := "Bright"
+	timezone := "UTC+8\tAsia/Shanghai"
+	now := time.Now().Truncate(time.Second)
+
+	nickname := info.Nickname
+	if nickname == "" {
+		nickname = info.Username
+	}
+	var avatar *string
+	if info.Avatar != "" {
+		avatar = &info.Avatar
+	}
+
+	user := &entity.User{
+		ID:              userID,
+		AccessToken:     &accessToken,
+		Email:           info.Email,
+		Nickname:        nickname,
+		Password:        nil,
+		Avatar:          avatar,
+		Status:          &status,
+		Language:        &language,
+		ColorSchema:     &colorSchema,
+		Timezone:        &timezone,
+		IsActive:        "1",
+		IsAuthenticated: "1",
+		IsAnonymous:     "0",
+		LastLoginTime:   &now,
+		LoginChannel:    &loginChannel,
+		IsSuperuser:     &isSuperuser,
+	}
+
+	tenantName := nickname + "'s Kingdom"
+	ttsID := cfg.GetDefaultTTSModel().Name
+	ocrID := cfg.GetDefaultOCRModel().Name
+	tenant := &entity.Tenant{
+		ID:        userID,
+		Name:      &tenantName,
+		LLMID:     cfg.GetDefaultChatModel().Name,
+		EmbdID:    cfg.GetDefaultEmbeddingModel().Name,
+		ASRID:     cfg.GetDefaultASRModel().Name,
+		Img2TxtID: cfg.GetDefaultVisionModel().Name,
+		RerankID:  cfg.GetDefaultRerankModel().Name,
+		TTSID:     &ttsID,
+		OCRID:     &ocrID,
+		ParserIDs: "naive:General,qa:Q&A,manual:Manual,table:Table,paper:Research Paper,book:Book,laws:Laws,presentation:Presentation,picture:Picture,one:One,audio:Audio,email:Email,tag:Tag",
+		Status:    &status,
+	}
+	userTenant := &entity.UserTenant{
+		ID:        common.GenerateToken(),
+		UserID:    userID,
+		TenantID:  userID,
+		Role:      "owner",
+		InvitedBy: userID,
+		Status:    &status,
+	}
+	fileID := common.GenerateToken()
+	emptyLoc := ""
+	rootFile := &entity.File{
+		ID:        fileID,
+		ParentID:  fileID,
+		TenantID:  userID,
+		CreatedBy: userID,
+		Name:      "/",
+		Type:      "folder",
+		Location:  &emptyLoc,
+		Size:      0,
+	}
+
+	db := dao.GetDB()
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(user).Error; err != nil {
+			return fmt.Errorf("failed to create user: %w", err)
+		}
+		if err := tx.Create(tenant).Error; err != nil {
+			return fmt.Errorf("failed to create tenant: %w", err)
+		}
+		if err := tx.Create(userTenant).Error; err != nil {
+			return fmt.Errorf("failed to create user tenant relation: %w", err)
+		}
+		if err := tx.Create(rootFile).Error; err != nil {
+			return fmt.Errorf("failed to create root folder: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("fail to create transaction: %w", err)
+	}
+	return user, nil
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+func oauthStateKey(channel, state string) string {
+	return fmt.Sprintf("oauth_state:%s:%s", channel, state)
+}
+
+// httpGet performs a GET with the SSRF-guarded client and returns the body,
+// capped at 1 MiB.
+func httpGet(ctx context.Context, rawURL string, headers map[string]string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := common.GetSSRFHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s returned %d", rawURL, resp.StatusCode)
+	}
+	return body, nil
 }

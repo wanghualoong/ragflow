@@ -17,13 +17,135 @@
 package handler
 
 import (
+	"net/http"
+	"net/url"
+
 	"ragflow/internal/common"
+	"ragflow/internal/engine/kvrocks"
+	"ragflow/internal/server"
 
 	"github.com/gin-gonic/gin"
 )
 
+// oauthStateCookiePrefix namespaces the per-channel CSRF state cookie set at
+// login-initiate time and verified (double-submit) at callback time.
+const oauthStateCookiePrefix = "ragflow_oauth_state_"
+
+func oauthStateCookieName(channel string) string {
+	return oauthStateCookiePrefix + channel
+}
+
+// setOAuthStateCookie stores the opaque CSRF state on the browser that started
+// the flow. Unlike the post-login auth cookie this one IS HttpOnly: the SPA
+// never needs to read it, and it must survive only the round-trip to the IdP.
+func setOAuthStateCookie(c *gin.Context, channel, state string, maxAgeSeconds int) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     oauthStateCookieName(channel),
+		Value:    state,
+		Path:     "/",
+		MaxAge:   maxAgeSeconds,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   c.Request.TLS != nil,
+	})
+}
+
+func clearOAuthStateCookie(c *gin.Context, channel string) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     oauthStateCookieName(channel),
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   c.Request.TLS != nil,
+	})
+}
+
+// loginErrorURL builds a redirect back to the SPA login page carrying a
+// human-readable error. OAuth callbacks are top-level browser navigations, so
+// errors must be surfaced as a redirect, not a JSON body.
+func loginErrorURL(msg string) string {
+	return "/login?error=" + url.QueryEscape(msg)
+}
+
+// OAuthLogin starts an SSO login for the channel named in the path by
+// redirecting the browser to the provider's authorization endpoint. A CSRF
+// state value is both stored server-side (consume-once) and set as an HttpOnly
+// cookie for a double-submit check on callback.
+func (h *UserHandler) OAuthLogin(c *gin.Context) {
+	channel := c.Param("channel")
+
+	init, _, err := h.userService.OAuthLoginInitiate(channel, kvrocks.Get())
+	if err != nil {
+		c.Redirect(http.StatusFound, loginErrorURL(err.Error()))
+		return
+	}
+
+	setOAuthStateCookie(c, channel, init.State, int(init.CookieMaxAge.Seconds()))
+	c.Redirect(http.StatusFound, init.AuthURL)
+}
+
+// OAuthChannelCallback completes the SSO flow: it verifies the CSRF state,
+// exchanges the authorization code, provisions/updates the user, mints the
+// signed access token, and redirects into the SPA with `?auth=<token>` (which
+// the frontend root-route loader persists to localStorage) plus the
+// ragflow_auth cookie.
+func (h *UserHandler) OAuthChannelCallback(c *gin.Context) {
+	ctx := c.Request.Context()
+	channel := c.Param("channel")
+
+	// The clear must happen regardless of outcome; the state is single-use.
+	defer clearOAuthStateCookie(c, channel)
+
+	// The IdP may report an error instead of returning a code.
+	if idpErr := c.Query("error"); idpErr != "" {
+		if desc := c.Query("error_description"); desc != "" {
+			idpErr = idpErr + ": " + desc
+		}
+		c.Redirect(http.StatusFound, loginErrorURL(idpErr))
+		return
+	}
+
+	code := c.Query("code")
+	state := c.Query("state")
+	expectedState, _ := c.Cookie(oauthStateCookieName(channel))
+
+	result, _, err := h.userService.OAuthCallback(ctx, channel, code, state, expectedState, kvrocks.Get())
+	if err != nil {
+		c.Redirect(http.StatusFound, loginErrorURL(err.Error()))
+		return
+	}
+
+	user := result.User
+	if user.AccessToken == nil {
+		c.Redirect(http.StatusFound, loginErrorURL("login failed: no access token issued"))
+		return
+	}
+
+	secretKey, err := server.GetSecretKey(ctx, kvrocks.Get())
+	if err != nil {
+		c.Redirect(http.StatusFound, loginErrorURL("login failed: cannot sign session"))
+		return
+	}
+	authToken, err := common.DumpAccessToken(*user.AccessToken, secretKey)
+	if err != nil {
+		c.Redirect(http.StatusFound, loginErrorURL("login failed: cannot sign session"))
+		return
+	}
+
+	// Same cookie the password login writes, so the SPA bootstraps identically.
+	setOAuthAuthCookie(c, authToken)
+
+	// The SPA root-route loader reads `?auth=` and writes it to localStorage,
+	// then strips the param and redirects to `/`. No frontend change needed.
+	c.Redirect(http.StatusFound, "/?auth="+url.QueryEscape(authToken))
+}
+
+// OAuthCallback is the generic (channel-less) callback. Duke uses the
+// per-channel route above; this remains a defensive error redirect.
 func (h *UserHandler) OAuthCallback(c *gin.Context) {
-	common.ErrorWithCode(c, common.CodeNotImplemented, "OAuthCallback not implemented")
+	c.Redirect(http.StatusFound, loginErrorURL("unsupported oauth callback"))
 }
 
 func (h *UserHandler) GitHubAuthCallback(c *gin.Context) {
@@ -66,14 +188,12 @@ func (h *UserHandler) GetMeta(c *gin.Context) {
 	common.ErrorWithCode(c, common.CodeNotImplemented, "GetMeta not implemented")
 }
 
-func (h *UserHandler) OAuthLogin(c *gin.Context) {
-	common.ErrorWithCode(c, common.CodeNotImplemented, "OAuthLogin not implemented")
-}
-
-func (h *UserHandler) OAuthChannelCallback(c *gin.Context) {
-	common.ErrorWithCode(c, common.CodeNotImplemented, "OAuthChannelCallback not implemented")
-}
-
+// GetLoginChannels returns the configured SSO channels for the login page.
 func (h *UserHandler) GetLoginChannels(c *gin.Context) {
-	common.SuccessWithData(c, []interface{}{}, "success")
+	channels, code, err := h.userService.GetLoginChannels()
+	if err != nil {
+		common.ErrorWithCode(c, code, err.Error())
+		return
+	}
+	common.SuccessWithData(c, channels, "success")
 }
