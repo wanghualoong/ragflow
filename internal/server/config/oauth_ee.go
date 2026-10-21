@@ -45,6 +45,13 @@ type OAuthProvider struct {
 
 	Scope       string
 	RedirectURI string
+
+	// TrustEmailVerified marks this IdP as institutionally trusted for the email
+	// address it returns, so a login is accepted even when the provider omits the
+	// `email_verified` claim. Leave false for public/multi-tenant IdPs so logins
+	// require email_verified=true (account-takeover guard). Set true only for a
+	// controlled IdP such as Duke NetID.
+	TrustEmailVerified bool
 }
 
 // OAuthConfig holds every configured SSO channel, keyed by channel name.
@@ -110,6 +117,9 @@ func (c *Config) ParseOAuthConfig(v *viper.Viper) error {
 		}
 		if ps.IsSet("redirect_uri") {
 			p.RedirectURI = ps.GetString("redirect_uri")
+		}
+		if ps.IsSet("trust_email_verified") {
+			p.TrustEmailVerified = ps.GetBool("trust_email_verified")
 		}
 
 		// A provider without credentials is a commented-out placeholder.

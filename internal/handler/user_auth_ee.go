@@ -69,6 +69,21 @@ func loginErrorURL(msg string) string {
 	return "/login?error=" + url.QueryEscape(msg)
 }
 
+// genericLoginError maps an internal error code to a short, safe message for the
+// login redirect. Raw service errors (IdP token-endpoint response bodies, DB
+// errors, internal URLs) must never reach the browser URL/history or proxy
+// logs — the full error is logged server-side instead.
+func genericLoginError(code common.ErrorCode) string {
+	switch code {
+	case common.CodeAuthenticationError:
+		return "login session expired, please try again"
+	case common.CodeForbidden:
+		return "account is not permitted to sign in"
+	default:
+		return "login failed"
+	}
+}
+
 // OAuthLogin starts an SSO login for the channel named in the path by
 // redirecting the browser to the provider's authorization endpoint. A CSRF
 // state value is both stored server-side (consume-once) and set as an HttpOnly
@@ -76,9 +91,10 @@ func loginErrorURL(msg string) string {
 func (h *UserHandler) OAuthLogin(c *gin.Context) {
 	channel := c.Param("channel")
 
-	init, _, err := h.userService.OAuthLoginInitiate(channel, kvrocks.Get())
+	init, code, err := h.userService.OAuthLoginInitiate(channel, kvrocks.Get())
 	if err != nil {
-		c.Redirect(http.StatusFound, loginErrorURL(err.Error()))
+		common.Error("oauth login initiate failed", err)
+		c.Redirect(http.StatusFound, loginErrorURL(genericLoginError(code)))
 		return
 	}
 
@@ -111,9 +127,10 @@ func (h *UserHandler) OAuthChannelCallback(c *gin.Context) {
 	state := c.Query("state")
 	expectedState, _ := c.Cookie(oauthStateCookieName(channel))
 
-	result, _, err := h.userService.OAuthCallback(ctx, channel, code, state, expectedState, kvrocks.Get())
+	result, errCode, err := h.userService.OAuthCallback(ctx, channel, code, state, expectedState, kvrocks.Get())
 	if err != nil {
-		c.Redirect(http.StatusFound, loginErrorURL(err.Error()))
+		common.Error("oauth callback failed", err)
+		c.Redirect(http.StatusFound, loginErrorURL(genericLoginError(errCode)))
 		return
 	}
 

@@ -156,9 +156,15 @@ func fetchOIDCMetadata(ctx context.Context, issuer string) (*oidcMetadata, error
 	return &m, nil
 }
 
-func fetchJWKS(ctx context.Context, uri string) (*jose.JSONWebKeySet, error) {
+// fetchJWKS returns the provider's JWKS, cached for discoveryTTL. When force is
+// true the cache is bypassed UNLESS it was refreshed within the last minute —
+// this lets verifyIDToken re-fetch once after a signing-key rotation (a new kid)
+// while rate-limiting refreshes so tokens carrying random/unknown kids cannot
+// trigger a fetch on every request.
+func fetchJWKS(ctx context.Context, uri string, force bool) (*jose.JSONWebKeySet, error) {
 	jwksMu.Lock()
-	if e, ok := jwksCache[uri]; ok && time.Since(e.fetchedAt) < discoveryTTL {
+	if e, ok := jwksCache[uri]; ok && time.Since(e.fetchedAt) < discoveryTTL &&
+		(!force || time.Since(e.fetchedAt) < time.Minute) {
 		s := e.set
 		jwksMu.Unlock()
 		return s, nil
@@ -369,10 +375,12 @@ func exchangeCode(ctx context.Context, r *resolvedProvider, code string) (*token
 
 // normalizedUser is the Duke-normalized identity (see normalizeUser).
 type normalizedUser struct {
-	Email    string
-	Username string
-	Nickname string
-	Avatar   string
+	Email         string
+	EmailVerified bool
+	Subject       string
+	Username      string
+	Nickname      string
+	Avatar        string
 }
 
 // fetchUserInfo gathers claims from the (optionally verified) ID token and the
@@ -383,11 +391,13 @@ func fetchUserInfo(ctx context.Context, r *resolvedProvider, tok *tokenResponse)
 	// ID token (OIDC): signature-verified against the provider's JWKS with a
 	// pinned algorithm allowlist. Failure is fatal — we never trust an
 	// unverified ID token.
+	var idTokenSub string
 	if tok.IDToken != "" && r.jwksURI != "" {
 		idClaims, err := verifyIDToken(ctx, r, tok.IDToken)
 		if err != nil {
 			return nil, fmt.Errorf("verify id token: %w", err)
 		}
+		idTokenSub, _ = idClaims["sub"].(string)
 		for k, v := range idClaims {
 			claims[k] = v
 		}
@@ -405,6 +415,12 @@ func fetchUserInfo(ctx context.Context, r *resolvedProvider, tok *tokenResponse)
 		if err := json.Unmarshal(body, &ui); err != nil {
 			return nil, fmt.Errorf("decode userinfo: %w", err)
 		}
+		// OIDC Core §5.3.2: the userinfo `sub` MUST match the ID token `sub`.
+		// Reject a mismatch rather than let userinfo claims (which overwrite the
+		// ID-token claims below) describe a different principal.
+		if uiSub, _ := ui["sub"].(string); idTokenSub != "" && uiSub != "" && uiSub != idTokenSub {
+			return nil, fmt.Errorf("userinfo sub does not match id token sub")
+		}
 		for k, v := range ui {
 			claims[k] = v
 		}
@@ -414,13 +430,22 @@ func fetchUserInfo(ctx context.Context, r *resolvedProvider, tok *tokenResponse)
 }
 
 func verifyIDToken(ctx context.Context, r *resolvedProvider, idToken string) (jwt.MapClaims, error) {
-	set, err := fetchJWKS(ctx, r.jwksURI)
+	set, err := fetchJWKS(ctx, r.jwksURI, false)
 	if err != nil {
 		return nil, err
 	}
 	keyfunc := func(t *jwt.Token) (interface{}, error) {
 		kid, _ := t.Header["kid"].(string)
 		keys := set.Key(kid)
+		if len(keys) == 0 {
+			// The kid may be new because the IdP rotated its signing key after we
+			// cached the JWKS. Force one rate-limited refresh and retry before
+			// failing, so logins survive key rotation instead of breaking for up
+			// to discoveryTTL.
+			if fresh, ferr := fetchJWKS(ctx, r.jwksURI, true); ferr == nil {
+				keys = fresh.Key(kid)
+			}
+		}
 		if len(keys) == 0 {
 			return nil, fmt.Errorf("no signing key for kid %q", kid)
 		}
@@ -432,6 +457,8 @@ func verifyIDToken(ctx context.Context, r *resolvedProvider, idToken string) (jw
 		jwt.WithValidMethods(r.signingAlgs),
 		jwt.WithAudience(r.provider.ClientID),
 		jwt.WithIssuer(r.issuer),
+		jwt.WithExpirationRequired(), // OIDC Core §2 makes exp mandatory.
+		jwt.WithIssuedAt(),           // reject tokens whose iat is in the future.
 	)
 	if err != nil {
 		return nil, err
@@ -473,7 +500,27 @@ func normalizeUser(claims map[string]interface{}) *normalizedUser {
 	}
 	avatar := get("avatar_url", "picture")
 
-	return &normalizedUser{Email: email, Username: username, Nickname: nickname, Avatar: avatar}
+	return &normalizedUser{
+		Email:         email,
+		EmailVerified: getBool(claims, "email_verified"),
+		Subject:       get("sub"),
+		Username:      username,
+		Nickname:      nickname,
+		Avatar:        avatar,
+	}
+}
+
+// getBool reads a claim that may be encoded as a JSON bool or as the strings
+// "true"/"false" (some IdPs serialize email_verified as a string).
+func getBool(claims map[string]interface{}, key string) bool {
+	switch v := claims[key].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +530,20 @@ func normalizeUser(claims map[string]interface{}) *normalizedUser {
 // upsertOAuthUser rotates the access token for an existing user (keyed by
 // email) or provisions a brand-new user+tenant for a first-time SSO login.
 func (s *UserService) upsertOAuthUser(ctx context.Context, channel string, info *normalizedUser) (*entity.User, bool, common.ErrorCode, error) {
+	// Account-takeover guard: an SSO login is matched to an account by email, so
+	// an unverified email must not be trusted. Some IdPs let a user set an
+	// arbitrary email without verifying it; honoring that would let an attacker
+	// take over any existing account (incl. a superuser) by claiming its email.
+	// Require email_verified=true, unless the provider is explicitly marked
+	// trusted-for-email (trust_email_verified) — e.g. Duke NetID, an
+	// institutionally-controlled IdP that may omit the claim.
+	if !info.EmailVerified {
+		prov := server.GetConfig().GetOAuthConfig().Providers[channel]
+		if prov == nil || !prov.TrustEmailVerified {
+			return nil, false, common.CodeForbidden, fmt.Errorf("identity provider did not return a verified email")
+		}
+	}
+
 	existing, err := s.userDAO.GetByEmail(ctx, dao.DB, info.Email)
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, false, common.CodeServerError, fmt.Errorf("lookup user by email: %w", err)

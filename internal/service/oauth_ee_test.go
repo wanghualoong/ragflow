@@ -39,6 +39,17 @@ import (
 // 127.0.0.1. Mirrors internal/entity/models' withSSRFBypass.
 func oidcAllowLoopback(t *testing.T) {
 	t.Helper()
+	// Reset the package-level discovery/JWKS caches: they are keyed by URL with a
+	// 1h TTL, and an httptest server can reuse a just-closed port, so a stale key
+	// set (same testKID, different RSA key) would otherwise leak between tests and
+	// make verification flaky.
+	oidcMetaMu.Lock()
+	oidcMetaCache = map[string]*cachedMetadata{}
+	oidcMetaMu.Unlock()
+	jwksMu.Lock()
+	jwksCache = map[string]*cachedJWKS{}
+	jwksMu.Unlock()
+
 	prev := common.AllowAnyHostForTest
 	common.AllowAnyHostForTest = true
 	t.Cleanup(func() { common.AllowAnyHostForTest = prev })
@@ -224,8 +235,9 @@ func TestOIDCCallbackPipeline(t *testing.T) {
 		"email":              "jd456@dukekunshan.edu.cn",
 	}
 	m.userinfo = map[string]any{
-		"email":   "jd456@dukekunshan.edu.cn",
-		"picture": "https://idp.duke.edu/avatars/jd456.png",
+		"email":          "jd456@dukekunshan.edu.cn",
+		"email_verified": true,
+		"picture":        "https://idp.duke.edu/avatars/jd456.png",
 	}
 
 	ctx := context.Background()
@@ -254,6 +266,12 @@ func TestOIDCCallbackPipeline(t *testing.T) {
 	}
 	if info.Avatar != "https://idp.duke.edu/avatars/jd456.png" {
 		t.Errorf("avatar = %q, want userinfo picture", info.Avatar)
+	}
+	if !info.EmailVerified {
+		t.Error("expected EmailVerified=true from userinfo email_verified")
+	}
+	if info.Subject != "duke-unique-0001" {
+		t.Errorf("subject = %q, want duke-unique-0001", info.Subject)
 	}
 }
 
@@ -356,15 +374,15 @@ func TestVerifyIDTokenDiscoveredIssuerTrailingSlash(t *testing.T) {
 // --- Duke normalization precedence -----------------------------------------
 func TestNormalizeUserDukeFallbacks(t *testing.T) {
 	cases := []struct {
-		name                               string
-		claims                             map[string]any
+		name                                      string
+		claims                                    map[string]any
 		wantUser, wantNick, wantEmail, wantAvatar string
 	}{
 		{
-			name:      "username claim wins over all",
-			claims:    map[string]any{"username": "u1", "preferred_username": "p1", "dukeNetID": "d1", "sub": "s1"},
-			wantUser:  "u1",
-			wantNick:  "u1",
+			name:     "username claim wins over all",
+			claims:   map[string]any{"username": "u1", "preferred_username": "p1", "dukeNetID": "d1", "sub": "s1"},
+			wantUser: "u1",
+			wantNick: "u1",
 		},
 		{
 			name:     "preferred_username over dukeNetID/sub",

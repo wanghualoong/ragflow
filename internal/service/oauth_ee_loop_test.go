@@ -151,10 +151,12 @@ func TestOIDCFullLoopWithConfig(t *testing.T) {
 		"preferred_username": "jd456",
 		"name":               "Jane Doe",
 		"email":              "jd456@dukekunshan.edu.cn",
+		"email_verified":     true,
 	}
 	m.userinfo = map[string]any{
-		"email":   "jd456@dukekunshan.edu.cn",
-		"picture": "https://idp.duke.edu/avatars/jd456.png",
+		"email":          "jd456@dukekunshan.edu.cn",
+		"email_verified": true,
+		"picture":        "https://idp.duke.edu/avatars/jd456.png",
 	}
 
 	res, _, err := svc.OAuthCallback(ctx, "oidc", "code-1", "state-A", "state-A", nil)
@@ -216,5 +218,68 @@ func TestOIDCFullLoopWithConfig(t *testing.T) {
 	}
 	if code != common.CodeAuthenticationError {
 		t.Errorf("mismatched-state code = %v, want CodeAuthenticationError", code)
+	}
+}
+
+// newOIDCLoopFixture wires server config + in-memory DB + a mock IdP and returns
+// a service and the mock with its OIDC provider pointed at the mock.
+func newOIDCLoopFixture(t *testing.T) (*UserService, *mockIdP) {
+	t.Helper()
+	setupOIDCServerConfig(t)
+	oidcAllowLoopback(t)
+	pushServiceDB(t, setupServiceTestDB(t))
+	m := newMockIdP(t)
+	prov := server.GetConfig().GetOAuthConfig().Providers["oidc"]
+	if prov == nil {
+		t.Fatal("oidc provider not registered")
+	}
+	prov.Issuer = m.baseURL
+	prov.ClientID = testClientID
+	prov.ClientSecret = testClientSecret
+	prov.RedirectURI = "https://ragflow.dukekunshan.edu.cn/api/v1/auth/oauth/oidc/callback"
+	prov.Scope = "openid email profile"
+	return NewUserService(), m
+}
+
+// TestOIDCRejectsUnverifiedEmail: an untrusted provider that does not assert
+// email_verified=true must not let a login bind to an email (account-takeover guard).
+func TestOIDCRejectsUnverifiedEmail(t *testing.T) {
+	svc, m := newOIDCLoopFixture(t)
+	m.idTokClaim = jwt.MapClaims{"sub": "s-unverif", "preferred_username": "nover", "email": "nover@dukekunshan.edu.cn"}
+	m.userinfo = map[string]any{"email": "nover@dukekunshan.edu.cn"} // no email_verified
+	_, code, err := svc.OAuthCallback(context.Background(), "oidc", "c", "s", "s", nil)
+	if err == nil {
+		t.Fatal("expected unverified email to be rejected")
+	}
+	if code != common.CodeForbidden {
+		t.Errorf("code = %v, want CodeForbidden", code)
+	}
+}
+
+// TestOIDCTrustEmailVerifiedAllowsUnverified: when the provider is marked
+// trust_email_verified, a login is accepted even without the email_verified claim.
+func TestOIDCTrustEmailVerifiedAllowsUnverified(t *testing.T) {
+	svc, m := newOIDCLoopFixture(t)
+	server.GetConfig().GetOAuthConfig().Providers["oidc"].TrustEmailVerified = true
+	m.idTokClaim = jwt.MapClaims{"sub": "s-trust", "preferred_username": "tuser", "email": "tuser@dukekunshan.edu.cn"}
+	m.userinfo = map[string]any{"email": "tuser@dukekunshan.edu.cn"} // no email_verified
+	res, _, err := svc.OAuthCallback(context.Background(), "oidc", "c", "s", "s", nil)
+	if err != nil {
+		t.Fatalf("trusted provider should accept unverified email: %v", err)
+	}
+	if !res.IsNewUser {
+		t.Error("expected a new user to be provisioned")
+	}
+}
+
+// TestOIDCRejectsSubMismatch: userinfo sub differing from the ID-token sub is a
+// protocol violation (OIDC Core §5.3.2) and must fail.
+func TestOIDCRejectsSubMismatch(t *testing.T) {
+	svc, m := newOIDCLoopFixture(t)
+	m.idTokClaim = jwt.MapClaims{"sub": "id-sub", "email": "x@dukekunshan.edu.cn", "email_verified": true}
+	m.userinfo = map[string]any{"sub": "different-sub", "email": "x@dukekunshan.edu.cn", "email_verified": true}
+	_, _, err := svc.OAuthCallback(context.Background(), "oidc", "c", "s", "s", nil)
+	if err == nil {
+		t.Fatal("expected sub mismatch between id_token and userinfo to be rejected")
 	}
 }
