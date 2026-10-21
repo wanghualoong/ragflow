@@ -183,7 +183,7 @@ func (m *mockIdP) resolved(t *testing.T) *resolvedProvider {
 			ClientID:     testClientID,
 			ClientSecret: testClientSecret,
 			Issuer:       m.baseURL,
-			RedirectURI:  "https://ragflow.dukekunshan.edu.cn/api/v1/auth/oauth/oidc/callback",
+			RedirectURI:  "https://ragflow.example.com/api/v1/auth/oauth/oidc/callback",
 		},
 		issuer:      meta.Issuer,
 		authURL:     meta.AuthorizationEndpoint,
@@ -226,18 +226,18 @@ func TestOIDCDiscoveryAndSigningAlgs(t *testing.T) {
 func TestOIDCCallbackPipeline(t *testing.T) {
 	oidcAllowLoopback(t)
 	m := newMockIdP(t)
-	// Duke NetID shape: no "username" claim, so preferred_username wins; the
+	// Example SSO shape: no "username" claim, so preferred_username wins; the
 	// avatar arrives only via userinfo's "picture", which must override.
 	m.idTokClaim = jwt.MapClaims{
-		"sub":                "duke-unique-0001",
+		"sub":                "user-0001",
 		"preferred_username": "jd456",
 		"name":               "Jane Doe",
-		"email":              "jd456@dukekunshan.edu.cn",
+		"email":              "jd456@example.com",
 	}
 	m.userinfo = map[string]any{
-		"email":          "jd456@dukekunshan.edu.cn",
+		"email":          "jd456@example.com",
 		"email_verified": true,
-		"picture":        "https://idp.duke.edu/avatars/jd456.png",
+		"picture":        "https://idp.example.com/avatars/jd456.png",
 	}
 
 	ctx := context.Background()
@@ -255,7 +255,7 @@ func TestOIDCCallbackPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchUserInfo: %v", err)
 	}
-	if info.Email != "jd456@dukekunshan.edu.cn" {
+	if info.Email != "jd456@example.com" {
 		t.Errorf("email = %q", info.Email)
 	}
 	if info.Username != "jd456" {
@@ -264,14 +264,14 @@ func TestOIDCCallbackPipeline(t *testing.T) {
 	if info.Nickname != "Jane Doe" {
 		t.Errorf("nickname = %q, want Jane Doe", info.Nickname)
 	}
-	if info.Avatar != "https://idp.duke.edu/avatars/jd456.png" {
+	if info.Avatar != "https://idp.example.com/avatars/jd456.png" {
 		t.Errorf("avatar = %q, want userinfo picture", info.Avatar)
 	}
 	if !info.EmailVerified {
 		t.Error("expected EmailVerified=true from userinfo email_verified")
 	}
-	if info.Subject != "duke-unique-0001" {
-		t.Errorf("subject = %q, want duke-unique-0001", info.Subject)
+	if info.Subject != "user-0001" {
+		t.Errorf("subject = %q, want user-0001", info.Subject)
 	}
 }
 
@@ -283,12 +283,12 @@ func TestVerifyIDTokenRejections(t *testing.T) {
 	t.Run("valid token passes", func(t *testing.T) {
 		m := newMockIdP(t)
 		r := m.resolved(t)
-		idt := m.mintIDToken(t, m.signKey, "RS256", jwt.MapClaims{"email": "ok@dukekunshan.edu.cn"})
+		idt := m.mintIDToken(t, m.signKey, "RS256", jwt.MapClaims{"email": "ok@example.com"})
 		claims, err := verifyIDToken(context.Background(), r, idt)
 		if err != nil {
 			t.Fatalf("expected valid token, got error: %v", err)
 		}
-		if claims["email"] != "ok@dukekunshan.edu.cn" {
+		if claims["email"] != "ok@example.com" {
 			t.Fatalf("claims not returned: %v", claims)
 		}
 	})
@@ -348,7 +348,7 @@ func TestVerifyIDTokenRejections(t *testing.T) {
 	})
 }
 
-// TestVerifyIDTokenDiscoveredIssuerTrailingSlash reproduces the Duke case: the
+// TestVerifyIDTokenDiscoveredIssuerTrailingSlash reproduces a common real-world case: the
 // provider advertises an issuer WITH a trailing slash ("…/oidc/") while the
 // configured discovery URL has none ("…/oidc"), and the ID token's `iss` carries
 // the slash. Verification must use the DISCOVERED issuer, not the config string,
@@ -365,49 +365,44 @@ func TestVerifyIDTokenDiscoveredIssuerTrailingSlash(t *testing.T) {
 	if r.issuer != m.baseURL+"/" {
 		t.Fatalf("resolved issuer = %q, want %q", r.issuer, m.baseURL+"/")
 	}
-	idt := m.mintIDToken(t, m.signKey, "RS256", jwt.MapClaims{"email": "slash@dukekunshan.edu.cn"})
+	idt := m.mintIDToken(t, m.signKey, "RS256", jwt.MapClaims{"email": "slash@example.com"})
 	if _, err := verifyIDToken(context.Background(), r, idt); err != nil {
 		t.Fatalf("expected trailing-slash discovered issuer to verify, got: %v", err)
 	}
 }
 
-// --- Duke normalization precedence -----------------------------------------
-func TestNormalizeUserDukeFallbacks(t *testing.T) {
+// --- claim normalization precedence ----------------------------------------
+func TestNormalizeUserClaims(t *testing.T) {
 	cases := []struct {
 		name                                      string
 		claims                                    map[string]any
+		provider                                  *config.OAuthProvider
 		wantUser, wantNick, wantEmail, wantAvatar string
 	}{
 		{
-			name:     "username claim wins over all",
-			claims:   map[string]any{"username": "u1", "preferred_username": "p1", "dukeNetID": "d1", "sub": "s1"},
+			name:     "username claim wins over all (default mapping)",
+			claims:   map[string]any{"username": "u1", "preferred_username": "p1", "sub": "s1"},
 			wantUser: "u1",
 			wantNick: "u1",
 		},
 		{
-			name:     "preferred_username over dukeNetID/sub",
-			claims:   map[string]any{"preferred_username": "p1", "dukeNetID": "d1", "sub": "s1"},
+			name:     "preferred_username over sub (default mapping)",
+			claims:   map[string]any{"preferred_username": "p1", "sub": "s1"},
 			wantUser: "p1",
 			wantNick: "p1",
 		},
 		{
-			name:     "dukeNetID over sub",
-			claims:   map[string]any{"dukeNetID": "d1", "sub": "s1"},
-			wantUser: "d1",
-			wantNick: "d1",
-		},
-		{
-			name:     "sub as last id fallback",
+			name:     "sub as last id fallback (default mapping)",
 			claims:   map[string]any{"sub": "s1"},
 			wantUser: "s1",
 			wantNick: "s1",
 		},
 		{
 			name:      "email prefix when no id claim",
-			claims:    map[string]any{"email": "alice@dukekunshan.edu.cn"},
+			claims:    map[string]any{"email": "alice@example.com"},
 			wantUser:  "alice",
 			wantNick:  "alice",
-			wantEmail: "alice@dukekunshan.edu.cn",
+			wantEmail: "alice@example.com",
 		},
 		{
 			name:     "nickname prefers nickname then name",
@@ -422,10 +417,19 @@ func TestNormalizeUserDukeFallbacks(t *testing.T) {
 			wantNick:   "s1",
 			wantAvatar: "A",
 		},
+		{
+			// Configurable mapping: a deployment can point username at a
+			// provider-specific id claim, taking precedence over the defaults.
+			name:     "configured username_claims uses a provider-specific claim",
+			claims:   map[string]any{"org_uid": "x500", "preferred_username": "p1", "sub": "s1"},
+			provider: &config.OAuthProvider{UsernameClaims: []string{"org_uid", "preferred_username", "sub"}},
+			wantUser: "x500",
+			wantNick: "x500",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := normalizeUser(tc.claims)
+			got := normalizeUser(tc.claims, tc.provider)
 			if got.Username != tc.wantUser {
 				t.Errorf("username = %q, want %q", got.Username, tc.wantUser)
 			}

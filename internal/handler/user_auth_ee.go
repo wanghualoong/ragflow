@@ -159,7 +159,7 @@ func (h *UserHandler) OAuthChannelCallback(c *gin.Context) {
 	c.Redirect(http.StatusFound, "/?auth="+url.QueryEscape(authToken))
 }
 
-// OAuthCallback is the generic (channel-less) callback. Duke uses the
+// OAuthCallback is the generic (channel-less) callback. Deployments use the
 // per-channel route above; this remains a defensive error redirect.
 func (h *UserHandler) OAuthCallback(c *gin.Context) {
 	c.Redirect(http.StatusFound, loginErrorURL("unsupported oauth callback"))

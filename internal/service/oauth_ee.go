@@ -223,8 +223,8 @@ func (s *UserService) resolveProvider(ctx context.Context, channel string) (*res
 		}
 		// The ID token's `iss` must equal the issuer the provider DECLARES in its
 		// discovery document, not the configured discovery base — they differ
-		// routinely by a trailing slash (e.g. Duke advertises
-		// "https://oauth.oit.duke.edu/oidc/" while the config carries it without
+		// routinely by a trailing slash (e.g. a provider advertises
+		// "https://idp.example.com/oidc/" while the config carries it without
 		// the slash). Verify against the discovered value (OIDC Core §3.1.3.7).
 		if m.Issuer != "" {
 			r.issuer = m.Issuer
@@ -373,7 +373,7 @@ func exchangeCode(ctx context.Context, r *resolvedProvider, code string) (*token
 	return &tr, nil
 }
 
-// normalizedUser is the Duke-normalized identity (see normalizeUser).
+// normalizedUser is the OIDC-normalized identity (see normalizeUser).
 type normalizedUser struct {
 	Email         string
 	EmailVerified bool
@@ -426,7 +426,7 @@ func fetchUserInfo(ctx context.Context, r *resolvedProvider, tok *tokenResponse)
 		}
 	}
 
-	return normalizeUser(claims), nil
+	return normalizeUser(claims, r.provider), nil
 }
 
 func verifyIDToken(ctx context.Context, r *resolvedProvider, idToken string) (jwt.MapClaims, error) {
@@ -466,14 +466,18 @@ func verifyIDToken(ctx context.Context, r *resolvedProvider, idToken string) (jw
 	return claims, nil
 }
 
-// normalizeUser applies the Duke NetID field precedence:
-//   - email from userinfo
-//   - username = username | preferred_username | dukeNetID | sub, else email prefix
-//   - nickname = nickname | name, else username
-//   - avatar = avatar_url | picture
+// normalizeUser maps OIDC/OAuth2 claims to a user identity using the provider's
+// configured claim precedence (p.UsernameClaims etc.), falling back to standard
+// OIDC claims. Keeping the claim names in config (service_conf) lets a
+// deployment point at a provider-specific id claim without any code change.
 //
-// This mirrors api/apps/auth/oauth.py normalize_user_info.
-func normalizeUser(claims map[string]interface{}) *normalizedUser {
+//   - email    = first non-empty of EmailClaims    (default: email)
+//   - username = first non-empty of UsernameClaims (default: username,
+//     preferred_username, sub), else the email local-part
+//   - nickname = first non-empty of NicknameClaims (default: nickname, name),
+//     else username
+//   - avatar   = first non-empty of AvatarClaims   (default: avatar_url, picture)
+func normalizeUser(claims map[string]interface{}, p *config.OAuthProvider) *normalizedUser {
 	get := func(keys ...string) string {
 		for _, k := range keys {
 			if v, ok := claims[k]; ok {
@@ -484,9 +488,25 @@ func normalizeUser(claims map[string]interface{}) *normalizedUser {
 		}
 		return ""
 	}
+	orDefault := func(configured []string, def ...string) []string {
+		if len(configured) > 0 {
+			return configured
+		}
+		return def
+	}
 
-	email := get("email")
-	username := get("username", "preferred_username", "dukeNetID", "sub")
+	var usernameClaims, emailClaims, nicknameClaims, avatarClaims []string
+	if p != nil {
+		usernameClaims, emailClaims = p.UsernameClaims, p.EmailClaims
+		nicknameClaims, avatarClaims = p.NicknameClaims, p.AvatarClaims
+	}
+	usernameClaims = orDefault(usernameClaims, "username", "preferred_username", "sub")
+	emailClaims = orDefault(emailClaims, "email")
+	nicknameClaims = orDefault(nicknameClaims, "nickname", "name")
+	avatarClaims = orDefault(avatarClaims, "avatar_url", "picture")
+
+	email := get(emailClaims...)
+	username := get(usernameClaims...)
 	if username == "" && email != "" {
 		if i := strings.Index(email, "@"); i > 0 {
 			username = email[:i]
@@ -494,11 +514,11 @@ func normalizeUser(claims map[string]interface{}) *normalizedUser {
 			username = email
 		}
 	}
-	nickname := get("nickname", "name")
+	nickname := get(nicknameClaims...)
 	if nickname == "" {
 		nickname = username
 	}
-	avatar := get("avatar_url", "picture")
+	avatar := get(avatarClaims...)
 
 	return &normalizedUser{
 		Email:         email,
@@ -535,7 +555,7 @@ func (s *UserService) upsertOAuthUser(ctx context.Context, channel string, info 
 	// arbitrary email without verifying it; honoring that would let an attacker
 	// take over any existing account (incl. a superuser) by claiming its email.
 	// Require email_verified=true, unless the provider is explicitly marked
-	// trusted-for-email (trust_email_verified) — e.g. Duke NetID, an
+	// trusted-for-email (trust_email_verified) — e.g. Example SSO, an
 	// institutionally-controlled IdP that may omit the claim.
 	if !info.EmailVerified {
 		prov := server.GetConfig().GetOAuthConfig().Providers[channel]
@@ -564,11 +584,11 @@ func (s *UserService) upsertOAuthUser(ctx context.Context, channel string, info 
 
 	// OIDC provisioning is intentionally NOT gated by EnableRegister():
 	// EnableRegister() (REGISTER_ENABLED) controls *password* self-signup only.
-	// An identity vouched for by the trusted IdP (Duke NetID) is always
+	// An identity vouched for by the trusted IdP (Example SSO) is always
 	// provisioned on first login. This matches the v0.27.2 Python behavior where
 	// the OAuth callback (api/apps/restful_apis/user_api.py) calls user_register
 	// directly, bypassing the REGISTER_ENABLED check that guards only the
-	// password /register endpoint — so new Duke users keep onboarding via SSO
+	// password /register endpoint — so new users keep onboarding via SSO
 	// even with REGISTER_ENABLED=0.
 	cfg := server.GetConfig()
 	user, err := s.provisionOAuthUser(channel, info, cfg)

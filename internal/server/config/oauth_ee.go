@@ -50,8 +50,21 @@ type OAuthProvider struct {
 	// address it returns, so a login is accepted even when the provider omits the
 	// `email_verified` claim. Leave false for public/multi-tenant IdPs so logins
 	// require email_verified=true (account-takeover guard). Set true only for a
-	// controlled IdP such as Duke NetID.
+	// controlled IdP you operate.
 	TrustEmailVerified bool
+
+	// Claim mappings (optional). Each is an ordered precedence list of claim
+	// names; the first non-empty match wins. Empty falls back to the OIDC
+	// defaults below. This keeps provider-specific claim names (e.g. an
+	// institution's own id claim) in config instead of hardcoded in the server.
+	//   UsernameClaims default: ["username", "preferred_username", "sub"]
+	//   EmailClaims    default: ["email"]
+	//   NicknameClaims default: ["nickname", "name"]
+	//   AvatarClaims   default: ["avatar_url", "picture"]
+	UsernameClaims []string
+	EmailClaims    []string
+	NicknameClaims []string
+	AvatarClaims   []string
 }
 
 // OAuthConfig holds every configured SSO channel, keyed by channel name.
@@ -120,6 +133,18 @@ func (c *Config) ParseOAuthConfig(v *viper.Viper) error {
 		}
 		if ps.IsSet("trust_email_verified") {
 			p.TrustEmailVerified = ps.GetBool("trust_email_verified")
+		}
+		if ps.IsSet("username_claims") {
+			p.UsernameClaims = ps.GetStringSlice("username_claims")
+		}
+		if ps.IsSet("email_claims") {
+			p.EmailClaims = ps.GetStringSlice("email_claims")
+		}
+		if ps.IsSet("nickname_claims") {
+			p.NicknameClaims = ps.GetStringSlice("nickname_claims")
+		}
+		if ps.IsSet("avatar_claims") {
+			p.AvatarClaims = ps.GetStringSlice("avatar_claims")
 		}
 
 		// A provider without credentials is a commented-out placeholder.
